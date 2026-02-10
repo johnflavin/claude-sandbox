@@ -1,0 +1,26 @@
+# .condarc -- Option C: OCI mirror pulled to local filesystem, served via nginx
+#
+# Deploy this to the Jupyter pod base image at /etc/conda/.condarc
+# or mount it at ~/.condarc in each pod.
+#
+# Packages are mirrored to Harbor via conda-oci-mirror, then pulled
+# to a local filesystem cache and served via nginx on the staging node.
+#
+# Replace "staging.example.com" with your actual staging node hostname.
+
+# Point all channel lookups to the nginx-served mirror.
+channel_alias: http://staging.example.com:8080/conda
+
+# Override default channels.
+default_channels:
+  - http://staging.example.com:8080/conda/pkgs/main
+  - http://staging.example.com:8080/conda/pkgs/r
+
+# Channels to search.
+channels:
+  - conda-forge
+  - defaults
+
+ssl_verify: false
+
+anaconda_upload: false

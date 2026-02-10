@@ -1,0 +1,27 @@
+# .condarc -- Option B: conda-oci-forwarder backed by Harbor
+#
+# Deploy this to the Jupyter pod base image at /etc/conda/.condarc
+# or mount it at ~/.condarc in each pod.
+#
+# The conda-oci-forwarder runs on the staging node and translates
+# OCI artifacts from Harbor into a standard conda HTTP channel.
+#
+# Replace "staging.example.com:8000" with the forwarder's address.
+
+# Point all channel lookups to the forwarder.
+channel_alias: http://staging.example.com:8000
+
+# Override default channels to use the forwarder.
+default_channels:
+  - http://staging.example.com:8000/pkgs/main
+  - http://staging.example.com:8000/pkgs/r
+
+# Channels to search.
+channels:
+  - conda-forge
+  - defaults
+
+# The forwarder serves HTTP, not HTTPS. If using self-signed certs, adjust.
+ssl_verify: false
+
+anaconda_upload: false

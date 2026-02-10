@@ -1,0 +1,35 @@
+# docker-compose-forwarder.yml -- Option B: conda-oci-forwarder service
+#
+# Runs the conda-oci-forwarder on the staging node, translating OCI
+# artifacts from Harbor into a standard conda HTTP channel.
+#
+# WARNING: conda-oci-forwarder is an early prototype. Evaluate carefully
+# before using in production.
+#
+# Usage:
+#   docker compose -f docker-compose-forwarder.yml up -d
+
+services:
+  conda-oci-forwarder:
+    build:
+      context: https://github.com/jaimergp/conda-oci-forwarder.git
+      # Or clone the repo locally and use:
+      # context: ./conda-oci-forwarder
+    ports:
+      - "8000:8000"
+    environment:
+      # Point the forwarder at your Harbor registry instead of ghcr.io.
+      # NOTE: The default forwarder is hardcoded to ghcr.io/channel-mirrors.
+      # You will likely need to fork and modify the source to point to your
+      # Harbor instance. See the repository for details.
+      REGISTRY_URL: "harbor.staging.example.com"
+      REGISTRY_ORG: "conda-mirror"
+      # If Harbor requires authentication for pulls:
+      # ORAS_USER: "forwarder-reader"
+      # ORAS_PASS: "your-token-here"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

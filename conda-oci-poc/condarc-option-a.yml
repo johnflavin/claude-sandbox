@@ -1,0 +1,41 @@
+# .condarc -- Option A: Traditional Conda Proxy (Nexus / Artifactory)
+#
+# Deploy this to the Jupyter pod base image at /etc/conda/.condarc
+# or mount it at ~/.condarc in each pod.
+#
+# Replace "staging.example.com" with your actual staging node hostname.
+# Replace port numbers with your Nexus/proxy conda repository ports.
+
+# Redirect all community channel lookups to the staging proxy.
+# When a user runs `conda install -c conda-forge numpy`, conda will
+# resolve it to https://staging.example.com:8081/repository/conda-proxy/conda-forge
+channel_alias: https://staging.example.com:8081/repository/conda-proxy
+
+# Override the default channels to point to local proxy mirrors.
+default_channels:
+  - https://staging.example.com:8081/repository/conda-proxy/pkgs/main
+  - https://staging.example.com:8081/repository/conda-proxy/pkgs/r
+
+# The channels list that conda searches by default.
+channels:
+  - conda-forge
+  - defaults
+
+# If you only want to mirror specific community channels, use custom_channels
+# instead of channel_alias. custom_channels takes precedence over channel_alias.
+# custom_channels:
+#   conda-forge: https://staging.example.com:8081/repository/conda-forge-proxy
+#   bioconda: https://staging.example.com:8081/repository/bioconda-proxy
+
+# SSL verification -- set to false if using self-signed certs on staging node.
+# Prefer setting ssl_verify to a CA bundle path if possible.
+ssl_verify: true
+# ssl_verify: /etc/ssl/certs/staging-ca.pem
+
+# Disable automatic uploads of environment data to anaconda.org
+anaconda_upload: false
+
+# Prevent users from adding external channels that bypass the proxy.
+# Set this in the system-level .condarc (/etc/conda/.condarc) so it
+# cannot be overridden by user-level config.
+# allow_other_channels: false
