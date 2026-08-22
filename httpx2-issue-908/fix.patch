@@ -1,0 +1,551 @@
+diff --git a/src/httpcore2/httpcore2/_async/http2.py b/src/httpcore2/httpcore2/_async/http2.py
+index 6f009c1..ccbbafc 100644
+--- a/src/httpcore2/httpcore2/_async/http2.py
++++ b/src/httpcore2/httpcore2/_async/http2.py
+@@ -16,7 +16,7 @@ import h2.settings
+ from .._backends.base import AsyncNetworkStream
+ from .._exceptions import ConnectionNotAvailable, LocalProtocolError, RemoteProtocolError
+ from .._models import Origin, Request, Response
+-from .._synchronization import AsyncLock, AsyncSemaphore, AsyncShieldCancellation
++from .._synchronization import AsyncLock, AsyncSemaphore, AsyncShieldCancellation, AsyncThreadLock
+ from .._trace import Trace
+ from .._utils import safe_async_iterate
+ from .interfaces import AsyncConnectionInterface
+@@ -53,6 +53,11 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
+         self._request_count = 0
+         self._init_lock = AsyncLock()
+         self._state_lock = AsyncLock()
++        # The `h2` state machine, and the HPACK encoder and decoder that it owns,
++        # are not thread-safe. Every interaction with `self._h2_state` is guarded
++        # by this lock, which is only ever held for non-blocking operations, and
++        # never held across network I/O.
++        self._h2_state_lock = AsyncThreadLock()
+         self._read_lock = AsyncLock()
+         self._write_lock = AsyncLock()
+         self._sent_connection_init = False
+@@ -113,19 +118,17 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
+ 
+         await self._max_streams_semaphore.acquire()
+ 
+-        try:
+-            stream_id = self._h2_state.get_next_available_stream_id()
+-            self._events[stream_id] = []
+-        except h2.exceptions.NoAvailableStreamIDError:  # pragma: no cover
+-            self._used_all_stream_ids = True
+-            self._request_count -= 1
+-            await self._max_streams_semaphore.release()
+-            raise ConnectionNotAvailable()
++        # `stream_id` is only assigned once the request headers have been sent,
++        # so that we can tell whether there is any per-stream state to clean up
++        # if something fails while we're opening the stream.
++        stream_id: int | None = None
+ 
+         try:
+-            kwargs = {"request": request, "stream_id": stream_id}
+-            async with Trace("send_request_headers", logger, request, kwargs):
+-                await self._send_request_headers(request=request, stream_id=stream_id)
++            kwargs: dict[str, typing.Any] = {"request": request}
++            async with Trace("send_request_headers", logger, request, kwargs) as trace:
++                stream_id = self._send_request_headers(request=request)
++                kwargs["stream_id"] = trace.return_value = stream_id
++                await self._write_outgoing_data(request)
+             async with Trace("send_request_body", logger, request, kwargs):
+                 await self._send_request_body(request=request, stream_id=stream_id)
+             async with Trace("receive_response_headers", logger, request, kwargs) as trace:
+@@ -142,8 +145,19 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
+                     "stream_id": stream_id,
+                 },
+             )
++        except h2.exceptions.NoAvailableStreamIDError:  # pragma: no cover
++            self._used_all_stream_ids = True
++            self._request_count -= 1
++            await self._max_streams_semaphore.release()
++            raise ConnectionNotAvailable()
++
+         except BaseException as exc:  # noqa: PIE786
+             with AsyncShieldCancellation():
++                if stream_id is None:
++                    # The stream was never opened, so `_response_closed` has no
++                    # per-stream state to clean up, and won't hand back the
++                    # stream slot that we acquired for us.
++                    await self._max_streams_semaphore.release()
+                 kwargs = {"stream_id": stream_id}
+                 async with Trace("response_closed", logger, request, kwargs):
+                     await self._response_closed(stream_id=stream_id)
+@@ -191,15 +205,21 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
+         # RFC despite the RFC mandating ignoring settings you don't know about.
+         del self._h2_state.local_settings[h2.settings.SettingCodes.ENABLE_CONNECT_PROTOCOL]
+ 
+-        self._h2_state.initiate_connection()
+-        self._h2_state.increment_flow_control_window(2**24)
++        with self._h2_state_lock:
++            self._h2_state.initiate_connection()
++            self._h2_state.increment_flow_control_window(2**24)
+         await self._write_outgoing_data(request)
+ 
+     # Sending the request...
+ 
+-    async def _send_request_headers(self, request: Request, stream_id: int) -> None:
++    def _send_request_headers(self, request: Request) -> int:
+         """
+-        Send the request headers to a given stream ID.
++        Open a new stream, write the request headers into the outgoing buffer,
++        and return the stream ID.
++
++        The caller is responsible for flushing the buffer onto the network. We
++        don't do that here so that the stream ID is available to the caller even
++        if the write fails, and the stream can be cleaned up properly.
+         """
+         end_stream = not has_body_headers(request)
+ 
+@@ -224,9 +244,19 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
+             )
+         ]
+ 
+-        self._h2_state.send_headers(stream_id, headers, end_stream=end_stream)
+-        self._h2_state.increment_flow_control_window(2**24, stream_id=stream_id)
+-        await self._write_outgoing_data(request)
++        # Allocating the stream ID and sending the headers has to be a single
++        # atomic operation. `h2` only moves on to the next outbound stream ID
++        # once headers have been sent on the current one, so two requests
++        # sharing this connection would otherwise be handed the same ID. It also
++        # means header blocks are HPACK-encoded in stream ID order, which the
++        # protocol requires.
++        with self._h2_state_lock:
++            stream_id = self._h2_state.get_next_available_stream_id()
++            self._h2_state.send_headers(stream_id, headers, end_stream=end_stream)
++            self._h2_state.increment_flow_control_window(2**24, stream_id=stream_id)
++            self._events[stream_id] = []
++
++        return stream_id
+ 
+     async def _send_request_body(self, request: Request, stream_id: int) -> None:
+         """
+@@ -248,17 +278,29 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
+         """
+         position = 0
+         while position < len(data):
+-            max_flow = await self._wait_for_outgoing_flow(request, stream_id)
+-            chunk = data[position : position + max_flow]
++            await self._wait_for_outgoing_flow(request, stream_id)
++            with self._h2_state_lock:
++                # Re-check the available flow while holding the lock, since
++                # another request on this connection may have consumed some of
++                # it in the meantime.
++                max_flow = min(
++                    self._h2_state.local_flow_control_window(stream_id),
++                    self._h2_state.max_outbound_frame_size,
++                )
++                chunk = data[position : position + max_flow]
++                if chunk:
++                    self._h2_state.send_data(stream_id, chunk)
++            if not chunk:
++                continue
+             position += len(chunk)
+-            self._h2_state.send_data(stream_id, chunk)
+             await self._write_outgoing_data(request)
+ 
+     async def _send_end_stream(self, request: Request, stream_id: int) -> None:
+         """
+         Send an empty data frame on on a given stream ID with the END_STREAM flag set.
+         """
+-        self._h2_state.end_stream(stream_id)
++        with self._h2_state_lock:
++            self._h2_state.end_stream(stream_id)
+         await self._write_outgoing_data(request)
+ 
+     # Receiving the response...
+@@ -293,7 +335,8 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
+                 assert event.flow_controlled_length is not None
+                 assert event.data is not None
+                 amount = event.flow_controlled_length
+-                self._h2_state.acknowledge_received_data(amount, stream_id)
++                with self._h2_state_lock:
++                    self._h2_state.acknowledge_received_data(amount, stream_id)
+                 await self._write_outgoing_data(request)
+                 yield event.data
+             elif isinstance(event, h2.events.StreamEnded):
+@@ -373,9 +416,9 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
+                     await self._max_streams_semaphore.acquire()
+                     self._max_streams -= 1
+ 
+-    async def _response_closed(self, stream_id: int) -> None:
++    async def _response_closed(self, stream_id: int | None) -> None:
+         async with self._state_lock:
+-            if stream_id in self._events:
++            if stream_id is not None and stream_id in self._events:
+                 await self._max_streams_semaphore.release()
+                 del self._events[stream_id]
+             if self._connection_terminated and not self._events:
+@@ -392,7 +435,8 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
+     async def aclose(self) -> None:
+         # Note that this method unilaterally closes the connection, and does
+         # not have any kind of locking in place around it.
+-        self._h2_state.close_connection()
++        with self._h2_state_lock:
++            self._h2_state.close_connection()
+         self._state = HTTPConnectionState.CLOSED
+         await self._network_stream.aclose()
+ 
+@@ -422,7 +466,8 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
+             self._connection_error = True
+             raise exc
+ 
+-        events: list[h2.events.Event] = self._h2_state.receive_data(data)
++        with self._h2_state_lock:
++            events: list[h2.events.Event] = self._h2_state.receive_data(data)
+ 
+         return events
+ 
+@@ -431,7 +476,11 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
+         timeout = timeouts.get("write", None)
+ 
+         async with self._write_lock:
+-            data_to_send = self._h2_state.data_to_send()
++            # Note that the write lock is held across both draining the buffered
++            # data and writing it out, so that frames always reach the network in
++            # the order that they were generated in.
++            with self._h2_state_lock:
++                data_to_send = self._h2_state.data_to_send()
+ 
+             if self._write_exception is not None:
+                 raise self._write_exception  # pragma: no cover
+@@ -453,23 +502,24 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
+ 
+     # Flow control...
+ 
+-    async def _wait_for_outgoing_flow(self, request: Request, stream_id: int) -> int:
++    async def _wait_for_outgoing_flow(self, request: Request, stream_id: int) -> None:
+         """
+-        Returns the maximum allowable outgoing flow for a given stream.
++        Wait until there is some allowable outgoing flow for a given stream.
+ 
+         If the allowable flow is zero, then waits on the network until
+         WindowUpdated frames have increased the flow rate.
+         https://tools.ietf.org/html/rfc7540#section-6.9
+         """
+-        local_flow: int = self._h2_state.local_flow_control_window(stream_id)
+-        max_frame_size: int = self._h2_state.max_outbound_frame_size
+-        flow = min(local_flow, max_frame_size)
++        with self._h2_state_lock:
++            local_flow: int = self._h2_state.local_flow_control_window(stream_id)
++            max_frame_size: int = self._h2_state.max_outbound_frame_size
++            flow = min(local_flow, max_frame_size)
+         while flow <= 0:
+             await self._receive_events(request)
+-            local_flow = self._h2_state.local_flow_control_window(stream_id)
+-            max_frame_size = self._h2_state.max_outbound_frame_size
+-            flow = min(local_flow, max_frame_size)
+-        return flow
++            with self._h2_state_lock:
++                local_flow = self._h2_state.local_flow_control_window(stream_id)
++                max_frame_size = self._h2_state.max_outbound_frame_size
++                flow = min(local_flow, max_frame_size)
+ 
+     # Interface for connection pooling...
+ 
+diff --git a/src/httpcore2/httpcore2/_sync/http2.py b/src/httpcore2/httpcore2/_sync/http2.py
+index ee314c8..827b27a 100644
+--- a/src/httpcore2/httpcore2/_sync/http2.py
++++ b/src/httpcore2/httpcore2/_sync/http2.py
+@@ -16,7 +16,7 @@ import h2.settings
+ from .._backends.base import NetworkStream
+ from .._exceptions import ConnectionNotAvailable, LocalProtocolError, RemoteProtocolError
+ from .._models import Origin, Request, Response
+-from .._synchronization import Lock, Semaphore, ShieldCancellation
++from .._synchronization import Lock, Semaphore, ShieldCancellation, ThreadLock
+ from .._trace import Trace
+ from .._utils import safe_iterate
+ from .interfaces import ConnectionInterface
+@@ -53,6 +53,11 @@ class HTTP2Connection(ConnectionInterface):
+         self._request_count = 0
+         self._init_lock = Lock()
+         self._state_lock = Lock()
++        # The `h2` state machine, and the HPACK encoder and decoder that it owns,
++        # are not thread-safe. Every interaction with `self._h2_state` is guarded
++        # by this lock, which is only ever held for non-blocking operations, and
++        # never held across network I/O.
++        self._h2_state_lock = ThreadLock()
+         self._read_lock = Lock()
+         self._write_lock = Lock()
+         self._sent_connection_init = False
+@@ -113,19 +118,17 @@ class HTTP2Connection(ConnectionInterface):
+ 
+         self._max_streams_semaphore.acquire()
+ 
+-        try:
+-            stream_id = self._h2_state.get_next_available_stream_id()
+-            self._events[stream_id] = []
+-        except h2.exceptions.NoAvailableStreamIDError:  # pragma: no cover
+-            self._used_all_stream_ids = True
+-            self._request_count -= 1
+-            self._max_streams_semaphore.release()
+-            raise ConnectionNotAvailable()
++        # `stream_id` is only assigned once the request headers have been sent,
++        # so that we can tell whether there is any per-stream state to clean up
++        # if something fails while we're opening the stream.
++        stream_id: int | None = None
+ 
+         try:
+-            kwargs = {"request": request, "stream_id": stream_id}
+-            with Trace("send_request_headers", logger, request, kwargs):
+-                self._send_request_headers(request=request, stream_id=stream_id)
++            kwargs: dict[str, typing.Any] = {"request": request}
++            with Trace("send_request_headers", logger, request, kwargs) as trace:
++                stream_id = self._send_request_headers(request=request)
++                kwargs["stream_id"] = trace.return_value = stream_id
++                self._write_outgoing_data(request)
+             with Trace("send_request_body", logger, request, kwargs):
+                 self._send_request_body(request=request, stream_id=stream_id)
+             with Trace("receive_response_headers", logger, request, kwargs) as trace:
+@@ -142,8 +145,19 @@ class HTTP2Connection(ConnectionInterface):
+                     "stream_id": stream_id,
+                 },
+             )
++        except h2.exceptions.NoAvailableStreamIDError:  # pragma: no cover
++            self._used_all_stream_ids = True
++            self._request_count -= 1
++            self._max_streams_semaphore.release()
++            raise ConnectionNotAvailable()
++
+         except BaseException as exc:  # noqa: PIE786
+             with ShieldCancellation():
++                if stream_id is None:
++                    # The stream was never opened, so `_response_closed` has no
++                    # per-stream state to clean up, and won't hand back the
++                    # stream slot that we acquired for us.
++                    self._max_streams_semaphore.release()
+                 kwargs = {"stream_id": stream_id}
+                 with Trace("response_closed", logger, request, kwargs):
+                     self._response_closed(stream_id=stream_id)
+@@ -191,15 +205,21 @@ class HTTP2Connection(ConnectionInterface):
+         # RFC despite the RFC mandating ignoring settings you don't know about.
+         del self._h2_state.local_settings[h2.settings.SettingCodes.ENABLE_CONNECT_PROTOCOL]
+ 
+-        self._h2_state.initiate_connection()
+-        self._h2_state.increment_flow_control_window(2**24)
++        with self._h2_state_lock:
++            self._h2_state.initiate_connection()
++            self._h2_state.increment_flow_control_window(2**24)
+         self._write_outgoing_data(request)
+ 
+     # Sending the request...
+ 
+-    def _send_request_headers(self, request: Request, stream_id: int) -> None:
++    def _send_request_headers(self, request: Request) -> int:
+         """
+-        Send the request headers to a given stream ID.
++        Open a new stream, write the request headers into the outgoing buffer,
++        and return the stream ID.
++
++        The caller is responsible for flushing the buffer onto the network. We
++        don't do that here so that the stream ID is available to the caller even
++        if the write fails, and the stream can be cleaned up properly.
+         """
+         end_stream = not has_body_headers(request)
+ 
+@@ -224,9 +244,19 @@ class HTTP2Connection(ConnectionInterface):
+             )
+         ]
+ 
+-        self._h2_state.send_headers(stream_id, headers, end_stream=end_stream)
+-        self._h2_state.increment_flow_control_window(2**24, stream_id=stream_id)
+-        self._write_outgoing_data(request)
++        # Allocating the stream ID and sending the headers has to be a single
++        # atomic operation. `h2` only moves on to the next outbound stream ID
++        # once headers have been sent on the current one, so two requests
++        # sharing this connection would otherwise be handed the same ID. It also
++        # means header blocks are HPACK-encoded in stream ID order, which the
++        # protocol requires.
++        with self._h2_state_lock:
++            stream_id = self._h2_state.get_next_available_stream_id()
++            self._h2_state.send_headers(stream_id, headers, end_stream=end_stream)
++            self._h2_state.increment_flow_control_window(2**24, stream_id=stream_id)
++            self._events[stream_id] = []
++
++        return stream_id
+ 
+     def _send_request_body(self, request: Request, stream_id: int) -> None:
+         """
+@@ -248,17 +278,29 @@ class HTTP2Connection(ConnectionInterface):
+         """
+         position = 0
+         while position < len(data):
+-            max_flow = self._wait_for_outgoing_flow(request, stream_id)
+-            chunk = data[position : position + max_flow]
++            self._wait_for_outgoing_flow(request, stream_id)
++            with self._h2_state_lock:
++                # Re-check the available flow while holding the lock, since
++                # another request on this connection may have consumed some of
++                # it in the meantime.
++                max_flow = min(
++                    self._h2_state.local_flow_control_window(stream_id),
++                    self._h2_state.max_outbound_frame_size,
++                )
++                chunk = data[position : position + max_flow]
++                if chunk:
++                    self._h2_state.send_data(stream_id, chunk)
++            if not chunk:
++                continue
+             position += len(chunk)
+-            self._h2_state.send_data(stream_id, chunk)
+             self._write_outgoing_data(request)
+ 
+     def _send_end_stream(self, request: Request, stream_id: int) -> None:
+         """
+         Send an empty data frame on on a given stream ID with the END_STREAM flag set.
+         """
+-        self._h2_state.end_stream(stream_id)
++        with self._h2_state_lock:
++            self._h2_state.end_stream(stream_id)
+         self._write_outgoing_data(request)
+ 
+     # Receiving the response...
+@@ -293,7 +335,8 @@ class HTTP2Connection(ConnectionInterface):
+                 assert event.flow_controlled_length is not None
+                 assert event.data is not None
+                 amount = event.flow_controlled_length
+-                self._h2_state.acknowledge_received_data(amount, stream_id)
++                with self._h2_state_lock:
++                    self._h2_state.acknowledge_received_data(amount, stream_id)
+                 self._write_outgoing_data(request)
+                 yield event.data
+             elif isinstance(event, h2.events.StreamEnded):
+@@ -373,9 +416,9 @@ class HTTP2Connection(ConnectionInterface):
+                     self._max_streams_semaphore.acquire()
+                     self._max_streams -= 1
+ 
+-    def _response_closed(self, stream_id: int) -> None:
++    def _response_closed(self, stream_id: int | None) -> None:
+         with self._state_lock:
+-            if stream_id in self._events:
++            if stream_id is not None and stream_id in self._events:
+                 self._max_streams_semaphore.release()
+                 del self._events[stream_id]
+             if self._connection_terminated and not self._events:
+@@ -392,7 +435,8 @@ class HTTP2Connection(ConnectionInterface):
+     def close(self) -> None:
+         # Note that this method unilaterally closes the connection, and does
+         # not have any kind of locking in place around it.
+-        self._h2_state.close_connection()
++        with self._h2_state_lock:
++            self._h2_state.close_connection()
+         self._state = HTTPConnectionState.CLOSED
+         self._network_stream.close()
+ 
+@@ -422,7 +466,8 @@ class HTTP2Connection(ConnectionInterface):
+             self._connection_error = True
+             raise exc
+ 
+-        events: list[h2.events.Event] = self._h2_state.receive_data(data)
++        with self._h2_state_lock:
++            events: list[h2.events.Event] = self._h2_state.receive_data(data)
+ 
+         return events
+ 
+@@ -431,7 +476,11 @@ class HTTP2Connection(ConnectionInterface):
+         timeout = timeouts.get("write", None)
+ 
+         with self._write_lock:
+-            data_to_send = self._h2_state.data_to_send()
++            # Note that the write lock is held across both draining the buffered
++            # data and writing it out, so that frames always reach the network in
++            # the order that they were generated in.
++            with self._h2_state_lock:
++                data_to_send = self._h2_state.data_to_send()
+ 
+             if self._write_exception is not None:
+                 raise self._write_exception  # pragma: no cover
+@@ -453,23 +502,24 @@ class HTTP2Connection(ConnectionInterface):
+ 
+     # Flow control...
+ 
+-    def _wait_for_outgoing_flow(self, request: Request, stream_id: int) -> int:
++    def _wait_for_outgoing_flow(self, request: Request, stream_id: int) -> None:
+         """
+-        Returns the maximum allowable outgoing flow for a given stream.
++        Wait until there is some allowable outgoing flow for a given stream.
+ 
+         If the allowable flow is zero, then waits on the network until
+         WindowUpdated frames have increased the flow rate.
+         https://tools.ietf.org/html/rfc7540#section-6.9
+         """
+-        local_flow: int = self._h2_state.local_flow_control_window(stream_id)
+-        max_frame_size: int = self._h2_state.max_outbound_frame_size
+-        flow = min(local_flow, max_frame_size)
++        with self._h2_state_lock:
++            local_flow: int = self._h2_state.local_flow_control_window(stream_id)
++            max_frame_size: int = self._h2_state.max_outbound_frame_size
++            flow = min(local_flow, max_frame_size)
+         while flow <= 0:
+             self._receive_events(request)
+-            local_flow = self._h2_state.local_flow_control_window(stream_id)
+-            max_frame_size = self._h2_state.max_outbound_frame_size
+-            flow = min(local_flow, max_frame_size)
+-        return flow
++            with self._h2_state_lock:
++                local_flow = self._h2_state.local_flow_control_window(stream_id)
++                max_frame_size = self._h2_state.max_outbound_frame_size
++                flow = min(local_flow, max_frame_size)
+ 
+     # Interface for connection pooling...
+ 
+diff --git a/tests/httpcore2/test_http2_threading.py b/tests/httpcore2/test_http2_threading.py
+new file mode 100644
+index 0000000..ad79178
+--- /dev/null
++++ b/tests/httpcore2/test_http2_threading.py
+@@ -0,0 +1,53 @@
++import threading
++import time
++import typing
++
++import hyperframe.frame
++
++import httpcore2
++
++
++def test_concurrent_requests_use_unique_stream_ids(monkeypatch) -> None:
++    """
++    Regression test for a race between threads sharing an HTTP/2 connection.
++
++    `h2` only moves on to the next outbound stream ID once headers have been
++    sent on the current one, so allocating a stream ID and sending the request
++    headers has to be a single atomic operation. Otherwise several threads are
++    handed the same stream ID, and the connection (and the HPACK encoder state
++    that goes with it) is corrupted.
++
++    See https://github.com/pydantic/httpx2/issues/908
++    """
++    origin = httpcore2.Origin(b"https", b"example.com", 443)
++    network_stream = httpcore2.MockStream([hyperframe.frame.SettingsFrame().serialize()])
++    conn = httpcore2.HTTP2Connection(origin=origin, stream=network_stream)
++    request = httpcore2.Request("GET", "https://example.com/", headers={"Host": "example.com"})
++    conn._send_connection_init(request)
++
++    send_headers = conn._h2_state.send_headers
++
++    def slow_send_headers(*args: typing.Any, **kwargs: typing.Any) -> typing.Any:
++        # Widen the window between allocating a stream ID and sending the
++        # headers that consume it, so that an unsynchronized implementation
++        # reliably hands the same ID out more than once.
++        time.sleep(0.05)
++        return send_headers(*args, **kwargs)
++
++    monkeypatch.setattr(conn._h2_state, "send_headers", slow_send_headers)
++
++    stream_ids: list[int] = []
++    results_lock = threading.Lock()
++
++    def send_request_headers() -> None:
++        stream_id = conn._send_request_headers(request=request)
++        with results_lock:
++            stream_ids.append(stream_id)
++
++    threads = [threading.Thread(target=send_request_headers) for _ in range(4)]
++    for thread in threads:
++        thread.start()
++    for thread in threads:
++        thread.join()
++
++    assert sorted(stream_ids) == [1, 3, 5, 7]
