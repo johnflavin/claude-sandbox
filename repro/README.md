@@ -72,6 +72,93 @@ with the surplus-idle pass excluding them too ("Reserved connections are not
 surplus: a request is about to be sent on them"). With that, the pool closes
 zero connections mid-run on this workload and the churn disappears entirely.
 
+The two halves of that landed in two different commits — see
+[Where it was fixed in httpx2](#where-it-was-fixed-in-httpx2) below. The
+`ReadError` itself stops reproducing one commit *earlier* than the reserved-
+connection work, because the branch that did the closing was deleted first.
+
+## Where it was fixed in httpx2
+
+Two commits in `pydantic/httpx2`, both in the vendored
+`src/httpcore2/httpcore2/_async/connection_pool.py`. Only seven commits have
+ever touched that file, so this is the whole story:
+
+### `8027999f` — perf: Rewrite `_assign_requests_to_connections` as a single-pass loop ([#974](https://github.com/pydantic/httpx2/pull/974), 2026-06-01)
+
+This is the one that kills the `ReadError`. It deletes the third assignment
+branch inherited from httpcore 1.0.5:
+
+```python
+elif idle_connections:
+    # log: "closing idle connection"
+    connection = idle_connections[0]      # no check that another waiting
+    self._connections.remove(connection)  # request was already assigned it
+    closing_connections.append(connection)
+    connection = self.create_connection(origin)
+    ...
+```
+
+When the pool is saturated, that branch closes a live idle connection to make
+room for a new one — picking `idle_connections[0]` with no regard for whether
+a waiting request had already been assigned it. It is replaced by a
+`new_connection_budget` counter that simply declines to over-allocate, so the
+pool stops closing connections mid-run at all. Measured: connections closed
+per run goes 505 → 0, and `ReadError` goes 1 → 0.
+
+### `b082502b` — Eliminate multi-assignment churn in the connection pool ([#1075](https://github.com/pydantic/httpx2/pull/1075), 2026-07-23)
+
+This is the one that kills the churn, and that makes the pool *structurally*
+immune to the race rather than merely not exercising it. It introduces the
+notion of a **reserved** connection — one assigned to a request that has not
+yet sent — and excludes reserved connections from every path that could close
+or re-hand-out a connection:
+
+```python
+elif not reserved and connection.has_expired():          # expiry pass
+...
+sum(connection.is_idle() and connection not in request_connections ...)  # surplus-idle pass
+...
+available_connections = [                                 # assignment pass
+    connection for connection in self._connections
+    if connection.is_available()
+    and not (connection.is_idle() and connection in request_connections
+             and not connection.can_multiplex())
+]
+```
+
+Its own comment names the exact failure mode measured above: *"an idle
+connection already assigned to an in-flight request is reserved: it stays IDLE
+until the winning task sends on it, so without this exclusion the next pass
+would assign it again and the loser would churn through
+`ConnectionNotAvailable`."*
+
+### Bisect
+
+`bisect_pool.sh` swaps each historical version of the pool file into an
+otherwise-stock httpx2 2.12.0 and re-runs the issue's workload:
+
+| pool version | connections closed | ReadError | `ConnectionNotAvailable` retries |
+| --- | --- | --- | --- |
+| `60c8262b` (pre-#974, the 1.0.5-era pool) | 505 | 1 | 1058 |
+| `8027999f` (#974) | **0** | **0** | 4244 |
+| `053cb9c0` (#983) | 0 | 0 | 4145 |
+| `b082502b` (#1075) | 0 | 0 | **0** |
+
+The `60c8262b` row is indicative rather than exact: that pool file is being
+run against httpx2 2.12.0's supporting modules, and the mismatch also produces
+307 spurious `PoolTimeout`s. The clean measurement of the 1.0.5-era behaviour
+is the real `httpcore 1.0.5` install in the table above (845 closes, 17–47 of
+them while reserved).
+
+### Methodology note: uv hardlinks
+
+`uv` hardlinks package files from its shared cache, so two venvs holding the
+same version share inodes. Overwriting the pool file in one venv silently
+rewrites it in the other *and* in the cache — an A/B set up that way compares
+a version against itself and shows no difference. Install the comparison venv
+with `UV_LINK_MODE=copy` and `--no-cache`, and assert `stat -c %h` is 1 before
+patching; `bisect_pool.sh` does both.
+
 ## Two flaws in the report's comparison
 
 1. **The two clients did not run at the same concurrency.**
@@ -125,6 +212,7 @@ aiohttp 3.14.3 1599/1600 ok | 1 x ClientOSError
 | `trace_pool.py` | instruments the connection pool to count the race directly |
 | `style_test.py` | same workload via `await` and via `async with client.stream` |
 | `run_matrix.sh` | controlled driver: one server, runs sequential, reports peaks |
+| `bisect_pool.sh` | swaps historical pool versions in to locate the fix commits |
 
 ## Running it
 
@@ -134,6 +222,13 @@ uv venv .venv-old && uv pip install --python .venv-old/bin/python 'httpx==0.27.0
 
 TRIALS=3 PORT=8010 DELAY=3    KEEPALIVE=5 ./run_matrix.sh issue
 TRIALS=3 PORT=8011 DELAY=0.05 KEEPALIVE=1 GAP=1.0 ./run_matrix.sh burst
+
+# For bisect_pool.sh: a scratch venv whose files are NOT hardlinked to the cache
+uv venv .venv-prefix
+UV_LINK_MODE=copy uv pip install --python .venv-prefix/bin/python \
+    --no-cache httpx2==2.12.0 numpy
+git clone https://github.com/pydantic/httpx2 /tmp/httpx2
+PORT=8021 ./bisect_pool.sh /tmp/httpx2
 ```
 
 `run_matrix.sh` runs each client sequentially against a single server on
