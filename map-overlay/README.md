@@ -39,5 +39,9 @@ pan and zoom, so one screen pixel covers the same number of metres at the centre
 both maps. Scale still varies slightly across a very zoomed-out view, as it does on any
 Mercator map.
 
+Maps are rendered with [MapLibre GL JS](https://maplibre.org/) using OSM raster tiles.
+Each map extends one tile past the screen edges so nearby tiles are preloaded, and a
+tile cache keeps recently seen areas so panning back does not re-download them.
+
 Search uses the public [Nominatim](https://nominatim.org/) API; tiles and data are
 © OpenStreetMap contributors.

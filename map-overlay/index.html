@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>Map Overlay</title>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/maplibre-gl/4.7.1/maplibre-gl.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/maplibre-gl/4.7.1/maplibre-gl.js"></script>
 <style>
   :root {
     --panel-bg: rgba(255, 255, 255, 0.94);
@@ -49,7 +49,9 @@
   html, body { margin: 0; height: 100%; overflow: hidden; background: #dfe3e6; }
   body { font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--panel-fg); }
 
-  .map { position: fixed; inset: 0; background: #dfe3e6; }
+  /* Maps extend one tile past every screen edge so nearby tiles are already loaded
+     before they scroll into view. Keep in sync with PAD in the script. */
+  .map { position: fixed; inset: -256px; background: #dfe3e6; }
   #top { pointer-events: none; opacity: 0.5; }
   #top.hidden { visibility: hidden; }
 
@@ -251,7 +253,7 @@
   'use strict';
 
   const DEG = Math.PI / 180;
-  const MIN_ZOOM = 1;
+  const MIN_ZOOM = 0;  // MapLibre levels
   const MAX_ZOOM = 20;
   const EARTH_MPP_Z0 = 156543.03392; // metres per pixel at the equator, zoom 0
 
@@ -263,42 +265,45 @@
 
   // ---------- Maps ----------
 
-  const mapOptions = {
-    zoomControl: false,
-    attributionControl: false,
-    dragging: false,
-    scrollWheelZoom: false,
-    doubleClickZoom: false,
-    boxZoom: false,
-    keyboard: false,
-    touchZoom: false,
-    tap: false,
-    zoomSnap: 0,
-    zoomAnimation: false,
-    markerZoomAnimation: false,
-    inertia: false,
-    minZoom: 0,
-    maxZoom: 22,
-  };
+  // MapLibre zoom levels are one less than OSM/Leaflet levels (512px world at zoom 0).
+  // The URL hash stores OSM levels so links match openstreetmap.org conventions.
+  const OSM_ZOOM_OFFSET = 1;
+  const PAD = 256; // offscreen margin of each map container, see the .map CSS rule
 
-  function tiles() {
-    return L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxNativeZoom: 19,
+  function makeMap(id) {
+    return new maplibregl.Map({
+      container: id,
+      style: {
+        version: 8,
+        sources: {
+          osm: {
+            type: 'raster',
+            tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+            tileSize: 256,
+            maxzoom: 19,
+          },
+        },
+        layers: [{ id: 'osm', type: 'raster', source: 'osm' }],
+      },
+      center: [0, 0],
+      zoom: 1,
+      minZoom: 0,
       maxZoom: 22,
-      keepBuffer: 4,
-      attribution: '',
+      interactive: false,
+      attributionControl: false,
+      fadeDuration: 100,
+      // Keep plenty of recently seen tiles so panning back doesn't re-download them.
+      maxTileCacheSize: 1500,
     });
   }
 
-  const bottom = L.map('bottom', mapOptions);
-  const top = L.map('top', mapOptions);
-  tiles().addTo(bottom);
-  tiles().addTo(top);
+  const bottom = makeMap('bottom');
+  const top = makeMap('top');
 
   const state = {
     bottomName: DEFAULTS.bottom.name,
     topName: DEFAULTS.top.name,
-    topAnchor: L.latLng(DEFAULTS.top.lat, DEFAULTS.top.lng),
+    topAnchor: { lat: DEFAULTS.top.lat, lng: DEFAULTS.top.lng },
   };
 
   // Web Mercator stretches distances by 1/cos(latitude). For both maps to show the same
@@ -308,9 +313,31 @@
     return bottomZoom + Math.log2(Math.cos(clampLat(topLat) * DEG) / Math.cos(clampLat(bottomLat) * DEG));
   }
   function metresPerPixel() {
-    return EARTH_MPP_Z0 * Math.cos(clampLat(bottom.getCenter().lat) * DEG) / Math.pow(2, bottom.getZoom());
+    return EARTH_MPP_Z0 * Math.cos(clampLat(bottom.getCenter().lat) * DEG) / Math.pow(2, bottom.getZoom() + OSM_ZOOM_OFFSET);
   }
-  function screenCenter() { return L.point(window.innerWidth / 2, window.innerHeight / 2); }
+  function screenCenter() { return { x: window.innerWidth / 2, y: window.innerHeight / 2 }; }
+
+  // Screen (client) point -> point inside the oversized map container.
+  function toContainer(p) { return [p.x + PAD, p.y + PAD]; }
+  function containerCenter(m) {
+    const c = m.getContainer();
+    return [c.clientWidth / 2, c.clientHeight / 2];
+  }
+
+  // Camera moves are applied with jumpTo, which updates the view synchronously and keeps
+  // already-loaded tiles (unlike a Leaflet view reset, which discards them all).
+  function panMap(m, dx, dy) {
+    const [cx, cy] = containerCenter(m);
+    m.jumpTo({ center: m.unproject([cx - dx, cy - dy]) });
+  }
+  function zoomMapAround(m, z, p) {
+    const cp = toContainer(p);
+    const anchor = m.unproject(cp);
+    m.jumpTo({ zoom: z });
+    const q = m.project(anchor);
+    const [cx, cy] = containerCenter(m);
+    m.jumpTo({ center: m.unproject([cx + q.x - cp[0], cy + q.y - cp[1]]) });
+  }
 
   function syncTopZoom(around) {
     // Zooming around a point moves the top map's centre latitude, which changes the zoom it
@@ -318,27 +345,27 @@
     for (let i = 0; i < 4; i++) {
       const z = topZoomFor(bottom.getZoom(), bottom.getCenter().lat, top.getCenter().lat);
       if (Math.abs(z - top.getZoom()) < 1e-6) return;
-      top.setZoomAround(around || screenCenter(), z, { animate: false });
+      zoomMapAround(top, z, around || screenCenter());
     }
   }
 
   function zoomTo(z, around) {
     z = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z));
     if (Math.abs(z - bottom.getZoom()) < 1e-9) return;
-    bottom.setZoomAround(around, z, { animate: false });
+    zoomMapAround(bottom, z, around);
     syncTopZoom(around);
     changed();
   }
   function zoomBy(dz, around) { zoomTo(bottom.getZoom() + dz, around || screenCenter()); }
 
   function panBoth(dx, dy) {
-    bottom.panBy([-dx, -dy], { animate: false });
-    top.panBy([-dx, -dy], { animate: false });
+    panMap(bottom, dx, dy);
+    panMap(top, dx, dy);
     syncTopZoom();
     changed();
   }
   function panTop(dx, dy) {
-    top.panBy([-dx, -dy], { animate: false });
+    panMap(top, dx, dy);
     syncTopZoom();
     changed();
   }
@@ -365,7 +392,7 @@
     const [a, b] = [...pointers.values()];
     return {
       dist: Math.hypot(a.x - b.x, a.y - b.y) || 1,
-      mid: L.point((a.x + b.x) / 2, (a.y + b.y) / 2),
+      mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
     };
   }
 
@@ -417,7 +444,7 @@
   document.addEventListener('gesturechange', (e) => {
     e.preventDefault();
     if (!gesture) return;
-    const at = e.clientX != null ? L.point(e.clientX, e.clientY) : screenCenter();
+    const at = e.clientX != null ? { x: e.clientX, y: e.clientY } : screenCenter();
     zoomTo(gesture.startZoom + Math.log2(e.scale), at);
   });
   document.addEventListener('gestureend', (e) => { e.preventDefault(); gesture = null; });
@@ -428,7 +455,7 @@
     let dy = e.deltaY;
     if (e.deltaMode === 1) { dx *= 16; dy *= 16; }
     else if (e.deltaMode === 2) { dx *= window.innerWidth; dy *= window.innerHeight; }
-    const at = L.point(e.clientX, e.clientY);
+    const at = { x: e.clientX, y: e.clientY };
 
     if (e.ctrlKey) {
       // Chrome, Edge and Firefox deliver trackpad pinches as ctrl+wheel.
@@ -446,7 +473,7 @@
 
   input.addEventListener('dblclick', (e) => {
     e.preventDefault();
-    zoomBy(e.shiftKey ? -1 : 1, L.point(e.clientX, e.clientY));
+    zoomBy(e.shiftKey ? -1 : 1, { x: e.clientX, y: e.clientY });
   });
 
   // ---------- Keyboard ----------
@@ -522,7 +549,7 @@
   filterSel.addEventListener('change', () => { topEl.style.filter = FILTERS[filterSel.value] || ''; changed(); });
 
   document.getElementById('recenter-top').addEventListener('click', () => {
-    top.setView(state.topAnchor, top.getZoom(), { animate: false });
+    top.jumpTo({ center: state.topAnchor });
     syncTopZoom();
     changed();
   });
@@ -531,11 +558,10 @@
     const b = bottom.getCenter();
     const t = top.getCenter();
     const bz = bottom.getZoom();
-    const bAnchor = b;
     [state.bottomName, state.topName] = [state.topName, state.bottomName];
-    bottom.setView(t, topZoomFor(bz, b.lat, t.lat), { animate: false });
-    top.setView(b, bz, { animate: false });
-    state.topAnchor = bAnchor;
+    bottom.jumpTo({ center: t, zoom: topZoomFor(bz, b.lat, t.lat) });
+    top.jumpTo({ center: b, zoom: bz });
+    state.topAnchor = { lat: b.lat, lng: b.lng };
     syncTopZoom();
     changed();
   });
@@ -551,18 +577,19 @@
 
   function placeBottom(r) {
     const [s, n, w, e] = r.boundingbox.map(Number);
-    const bounds = L.latLngBounds([s, w], [n, e]);
-    bottom.fitBounds(bounds, { animate: false, maxZoom: 16, padding: [40, 40] });
+    const cam = bottom.cameraForBounds([[w, s], [e, n]], { padding: PAD + 40, maxZoom: 15 });
+    if (cam) bottom.jumpTo(cam);
+    else bottom.jumpTo({ center: [Number(r.lon), Number(r.lat)] });
     state.bottomName = r.display_name;
     syncTopZoom();
     changed();
   }
 
   function placeTop(r) {
-    const ll = L.latLng(Number(r.lat), Number(r.lon));
+    const ll = { lat: Number(r.lat), lng: Number(r.lon) };
     state.topAnchor = ll;
     state.topName = r.display_name;
-    top.setView(ll, topZoomFor(bottom.getZoom(), bottom.getCenter().lat, ll.lat), { animate: false });
+    top.jumpTo({ center: ll, zoom: topZoomFor(bottom.getZoom(), bottom.getCenter().lat, ll.lat) });
     changed();
   }
 
@@ -657,7 +684,7 @@
     const t = top.getCenter();
     const a = state.topAnchor;
     const params = new URLSearchParams({
-      b: [b.lat.toFixed(5), b.lng.toFixed(5), bottom.getZoom().toFixed(3)].join(','),
+      b: [b.lat.toFixed(5), b.lng.toFixed(5), (bottom.getZoom() + OSM_ZOOM_OFFSET).toFixed(3)].join(','),
       t: [t.lat.toFixed(5), t.lng.toFixed(5)].join(','),
       a: [a.lat.toFixed(5), a.lng.toFixed(5)].join(','),
       o: opacity.value,
@@ -697,16 +724,19 @@
     if (p.get('f') && FILTERS[p.get('f')] != null) filterSel.value = p.get('f');
     state.bottomName = p.get('bn') || (p.has('b') ? '' : DEFAULTS.bottom.name);
     state.topName = p.get('tn') || (p.has('t') ? '' : DEFAULTS.top.name);
-    state.topAnchor = L.latLng(a[0], a[1]);
+    state.topAnchor = { lat: a[0], lng: a[1] };
 
-    bottom.setView([b[0], b[1]], Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, b[2])), { animate: false });
-    top.setView([t[0], t[1]], topZoomFor(bottom.getZoom(), b[0], t[0]), { animate: false });
+    const bz = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, b[2] - OSM_ZOOM_OFFSET));
+    bottom.jumpTo({ center: [b[1], b[0]], zoom: bz });
+    top.jumpTo({ center: [t[1], t[0]], zoom: topZoomFor(bz, b[0], t[0]) });
     topEl.style.filter = FILTERS[filterSel.value] || '';
     topEl.style.opacity = opacity.value / 100;
     opacityOut.textContent = opacity.value + '%';
   }
 
   window.addEventListener('resize', () => setTimeout(changed, 0));
+  bottom.on('error', (e) => console.warn('bottom map:', e.error && e.error.message));
+  top.on('error', (e) => console.warn('top map:', e.error && e.error.message));
 
   loadHash();
   updateModeUI();
