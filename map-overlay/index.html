@@ -1,0 +1,752 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Map Overlay</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="favicon.ico" sizes="16x16 32x32 48x48">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/maplibre-gl/4.7.1/maplibre-gl.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/maplibre-gl/4.7.1/maplibre-gl.js"></script>
+<style>
+  :root {
+    --panel-bg: rgba(255, 255, 255, 0.94);
+    --panel-fg: #1d232b;
+    --muted: #5d6874;
+    --border: rgba(20, 30, 40, 0.14);
+    --field-bg: #ffffff;
+    --hover: rgba(30, 90, 200, 0.08);
+    --accent: #2563eb;
+    --bottom-swatch: #4b5563;
+    --top-swatch: #e2483d;
+    --shadow: 0 8px 30px rgba(0, 0, 0, 0.18);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --panel-bg: rgba(28, 32, 38, 0.94);
+      --panel-fg: #e8ecf0;
+      --muted: #9aa5b1;
+      --border: rgba(255, 255, 255, 0.14);
+      --field-bg: #14181d;
+      --hover: rgba(120, 170, 255, 0.12);
+      --accent: #6ea0ff;
+      --bottom-swatch: #9ca3af;
+      --top-swatch: #ff7a70;
+      --shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+    }
+  }
+  :root[data-theme="dark"] {
+    --panel-bg: rgba(28, 32, 38, 0.94);
+    --panel-fg: #e8ecf0;
+    --muted: #9aa5b1;
+    --border: rgba(255, 255, 255, 0.14);
+    --field-bg: #14181d;
+    --hover: rgba(120, 170, 255, 0.12);
+    --accent: #6ea0ff;
+    --bottom-swatch: #9ca3af;
+    --top-swatch: #ff7a70;
+    --shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+  }
+
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #dfe3e6; }
+  body { font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--panel-fg); }
+
+  /* Maps extend one tile past every screen edge so nearby tiles are already loaded
+     before they scroll into view. Keep in sync with PAD in the script. */
+  .map { position: fixed; inset: -256px; background: #dfe3e6; }
+  #top { pointer-events: none; opacity: 0.5; }
+  #top.hidden { visibility: hidden; }
+
+  /* Transparent layer that receives all map gestures and drives both maps. */
+  #input { position: fixed; inset: 0; z-index: 500; touch-action: none; cursor: grab; }
+  #input.dragging { cursor: grabbing; }
+  #input.top-mode { cursor: move; }
+
+  .card {
+    position: fixed; z-index: 1000; background: var(--panel-bg); color: var(--panel-fg);
+    border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow);
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+  }
+
+  #panel {
+    top: 16px; left: 16px; width: min(360px, calc(100vw - 32px));
+    max-height: calc(100vh - 150px); overflow-y: auto; padding: 14px 16px 16px;
+    box-sizing: border-box;
+  }
+  #panel.collapsed { display: none; }
+  #panel header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  #panel h1 { font-size: 15px; margin: 0; font-weight: 650; }
+
+  #open-panel {
+    top: 16px; left: 16px; padding: 8px 12px; font: inherit; color: inherit; cursor: pointer;
+    display: none; align-items: center; gap: 6px;
+  }
+  #open-panel.shown { display: flex; }
+
+  .icon-btn {
+    border: 0; background: transparent; color: var(--muted); font-size: 20px; line-height: 1;
+    width: 30px; height: 30px; border-radius: 8px; cursor: pointer;
+  }
+  .icon-btn:hover { background: var(--hover); color: var(--panel-fg); }
+
+  section { padding: 10px 0; border-top: 1px solid var(--border); }
+  section:first-of-type { border-top: 0; }
+  .label { display: flex; align-items: center; gap: 8px; font-weight: 600; margin-bottom: 6px; }
+  .label small { font-weight: 400; color: var(--muted); }
+  .swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+  .swatch.bottom { background: var(--bottom-swatch); }
+  .swatch.top { background: var(--top-swatch); }
+
+  form.search { display: flex; gap: 6px; }
+  input[type="search"] {
+    flex: 1; min-width: 0; font: inherit; color: inherit; background: var(--field-bg);
+    border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px;
+  }
+  input[type="search"]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button.btn {
+    font: inherit; color: inherit; background: var(--field-bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 10px; cursor: pointer; white-space: nowrap;
+  }
+  button.btn:hover { background: var(--hover); }
+  .current { margin-top: 6px; color: var(--muted); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  ul.results { list-style: none; margin: 6px 0 0; padding: 0; border-radius: 8px; overflow: hidden; }
+  ul.results:empty { display: none; }
+  ul.results li {
+    padding: 7px 10px; cursor: pointer; border: 1px solid var(--border); border-top-width: 0;
+    background: var(--field-bg); font-size: 13px;
+  }
+  ul.results li:first-child { border-top-width: 1px; border-radius: 8px 8px 0 0; }
+  ul.results li:last-child { border-radius: 0 0 8px 8px; }
+  ul.results li:only-child { border-radius: 8px; }
+  ul.results li:hover, ul.results li:focus { background: var(--hover); outline: none; }
+  ul.results li.msg { cursor: default; color: var(--muted); }
+
+  .row { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+  .row label { flex: none; }
+  .row input[type="range"] { flex: 1; accent-color: var(--accent); }
+  .row output { width: 3.2em; text-align: right; font-variant-numeric: tabular-nums; }
+  select { font: inherit; color: inherit; background: var(--field-bg); border: 1px solid var(--border); border-radius: 8px; padding: 4px 6px; }
+  .buttons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  label.check { display: flex; align-items: center; gap: 8px; cursor: pointer; margin: 6px 0; }
+
+  .help { font-size: 12.5px; color: var(--muted); margin: 0; padding-left: 18px; }
+  .help li { margin: 2px 0; }
+  kbd {
+    font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; padding: 1px 5px; border-radius: 4px;
+    border: 1px solid var(--border); background: var(--field-bg); color: var(--panel-fg);
+  }
+
+  #legend {
+    left: 16px; bottom: 16px; padding: 8px 12px; font-size: 12.5px; pointer-events: none;
+    max-width: calc(100vw - 32px); box-sizing: border-box;
+  }
+  #legend .line { display: flex; align-items: center; gap: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #legend .mode { margin-top: 4px; color: var(--top-swatch); font-weight: 600; display: none; }
+  #legend .mode.on { display: block; }
+  .scale { margin-top: 6px; }
+  .scale .bar { height: 5px; border: 1.5px solid currentColor; border-top: 0; margin-bottom: 2px; }
+  .scale .txt { font-size: 11px; color: var(--muted); }
+
+  #attrib {
+    position: fixed; right: 0; bottom: 0; z-index: 1000; font-size: 11px; padding: 2px 6px;
+    background: rgba(255, 255, 255, 0.8); color: #333; border-top-left-radius: 6px;
+  }
+  #attrib a { color: #0b57d0; }
+
+  @media (max-width: 520px) {
+    #legend { bottom: 28px; }
+  }
+</style>
+</head>
+<body>
+  <div id="bottom" class="map" aria-label="Primary map"></div>
+  <div id="top" class="map" aria-label="Reference map overlay"></div>
+  <div id="input" aria-hidden="true"></div>
+
+  <button id="open-panel" class="card" type="button" title="Show search (Esc)">
+    <span aria-hidden="true">🔍</span> Search &amp; settings
+  </button>
+
+  <aside id="panel" class="card" aria-label="Search and settings">
+    <header>
+      <h1>Map overlay: compare scale</h1>
+      <button id="close-panel" class="icon-btn" type="button" title="Hide (Esc)" aria-label="Hide panel">×</button>
+    </header>
+
+    <section>
+      <div class="label"><span class="swatch bottom"></span>Primary <small>bottom · the place you're exploring</small></div>
+      <form class="search" data-target="bottom">
+        <input type="search" placeholder="Search a place…" autocomplete="off" aria-label="Search primary location">
+        <button class="btn" type="submit">Go</button>
+      </form>
+      <ul class="results" data-target="bottom"></ul>
+      <div class="current" id="bottom-name"></div>
+    </section>
+
+    <section>
+      <div class="label"><span class="swatch top"></span>Reference <small>top · a place you know</small></div>
+      <form class="search" data-target="top">
+        <input type="search" placeholder="Search a place…" autocomplete="off" aria-label="Search reference location">
+        <button class="btn" type="submit">Go</button>
+      </form>
+      <ul class="results" data-target="top"></ul>
+      <div class="current" id="top-name"></div>
+    </section>
+
+    <section>
+      <div class="row">
+        <label for="opacity">Top opacity</label>
+        <input id="opacity" type="range" min="0" max="100" step="1" value="50">
+        <output id="opacity-out" for="opacity">50%</output>
+      </div>
+      <div class="row">
+        <label for="filter">Top look</label>
+        <select id="filter">
+          <option value="none">Normal</option>
+          <option value="tint">Red tint</option>
+          <option value="gray">Grayscale</option>
+          <option value="invert">Inverted</option>
+        </select>
+      </div>
+      <label class="check"><input type="checkbox" id="lock-top"> Dragging moves the top map only</label>
+      <label class="check">
+        Two-finger scroll / wheel:
+        <select id="wheel-mode">
+          <option value="pan">pans</option>
+          <option value="zoom">zooms</option>
+        </select>
+      </label>
+      <div class="buttons">
+        <button class="btn" id="recenter-top" type="button" title="Put the reference location back under the screen centre">Re-centre top</button>
+        <button class="btn" id="swap" type="button" title="Swap which place is on top">Swap layers</button>
+      </div>
+    </section>
+
+    <section>
+      <ul class="help">
+        <li>Pinch (or <kbd>Ctrl</kbd>+scroll) zooms both maps at matched scale</li>
+        <li>Drag pans both maps together</li>
+        <li><kbd>Shift</kbd>/<kbd>⌥</kbd>+drag (or scroll) moves only the top map</li>
+        <li>Hold <kbd>Space</kbd> to peek at the bottom map</li>
+        <li>Double-click zooms in, <kbd>Shift</kbd>+double-click zooms out</li>
+        <li>Arrows pan, <kbd>+</kbd>/<kbd>−</kbd> zoom, <kbd>Esc</kbd> shows/hides this panel</li>
+      </ul>
+    </section>
+  </aside>
+
+  <div id="legend" class="card">
+    <div class="line"><span class="swatch bottom"></span><span id="legend-bottom"></span></div>
+    <div class="line"><span class="swatch top"></span><span id="legend-top"></span></div>
+    <div class="mode" id="legend-mode">Moving top map only</div>
+    <div class="scale">
+      <div class="bar" id="scale-m"></div><div class="txt" id="scale-m-txt"></div>
+      <div class="bar" id="scale-i" style="margin-top:4px"></div><div class="txt" id="scale-i-txt"></div>
+    </div>
+  </div>
+
+  <div id="attrib">
+    © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors
+    · Search by <a href="https://nominatim.org/" target="_blank" rel="noopener">Nominatim</a>
+  </div>
+
+<script>
+(() => {
+  'use strict';
+
+  const DEG = Math.PI / 180;
+  const MIN_ZOOM = 0;  // MapLibre levels
+  const MAX_ZOOM = 20;
+  const EARTH_MPP_Z0 = 156543.03392; // metres per pixel at the equator, zoom 0
+
+  const DEFAULTS = {
+    bottom: { lat: 35.6812, lng: 139.7671, zoom: 12, name: 'Tokyo, Japan' },
+    top: { lat: 40.7580, lng: -73.9855, name: 'Manhattan, New York' },
+    opacity: 50,
+  };
+
+  // ---------- Maps ----------
+
+  // MapLibre zoom levels are one less than OSM/Leaflet levels (512px world at zoom 0).
+  // The URL hash stores OSM levels so links match openstreetmap.org conventions.
+  const OSM_ZOOM_OFFSET = 1;
+  const PAD = 256; // offscreen margin of each map container, see the .map CSS rule
+
+  function makeMap(id) {
+    return new maplibregl.Map({
+      container: id,
+      style: {
+        version: 8,
+        sources: {
+          osm: {
+            type: 'raster',
+            tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+            tileSize: 256,
+            maxzoom: 19,
+          },
+        },
+        layers: [{ id: 'osm', type: 'raster', source: 'osm' }],
+      },
+      center: [0, 0],
+      zoom: 1,
+      minZoom: 0,
+      maxZoom: 22,
+      interactive: false,
+      attributionControl: false,
+      fadeDuration: 100,
+      // Keep plenty of recently seen tiles so panning back doesn't re-download them.
+      maxTileCacheSize: 1500,
+    });
+  }
+
+  const bottom = makeMap('bottom');
+  const top = makeMap('top');
+
+  const state = {
+    bottomName: DEFAULTS.bottom.name,
+    topName: DEFAULTS.top.name,
+    topAnchor: { lat: DEFAULTS.top.lat, lng: DEFAULTS.top.lng },
+  };
+
+  // Web Mercator stretches distances by 1/cos(latitude). For both maps to show the same
+  // metres-per-pixel, the top map's zoom must be offset by the ratio of the two cosines.
+  function clampLat(lat) { return Math.max(-85, Math.min(85, lat)); }
+  function topZoomFor(bottomZoom, bottomLat, topLat) {
+    return bottomZoom + Math.log2(Math.cos(clampLat(topLat) * DEG) / Math.cos(clampLat(bottomLat) * DEG));
+  }
+  function metresPerPixel() {
+    return EARTH_MPP_Z0 * Math.cos(clampLat(bottom.getCenter().lat) * DEG) / Math.pow(2, bottom.getZoom() + OSM_ZOOM_OFFSET);
+  }
+  function screenCenter() { return { x: window.innerWidth / 2, y: window.innerHeight / 2 }; }
+
+  // Screen (client) point -> point inside the oversized map container.
+  function toContainer(p) { return [p.x + PAD, p.y + PAD]; }
+  function containerCenter(m) {
+    const c = m.getContainer();
+    return [c.clientWidth / 2, c.clientHeight / 2];
+  }
+
+  // Camera moves are applied with jumpTo, which updates the view synchronously and keeps
+  // already-loaded tiles (unlike a Leaflet view reset, which discards them all).
+  function panMap(m, dx, dy) {
+    const [cx, cy] = containerCenter(m);
+    m.jumpTo({ center: m.unproject([cx - dx, cy - dy]) });
+  }
+  function zoomMapAround(m, z, p) {
+    const cp = toContainer(p);
+    const anchor = m.unproject(cp);
+    m.jumpTo({ zoom: z });
+    const q = m.project(anchor);
+    const [cx, cy] = containerCenter(m);
+    m.jumpTo({ center: m.unproject([cx + q.x - cp[0], cy + q.y - cp[1]]) });
+  }
+
+  function syncTopZoom(around) {
+    // Zooming around a point moves the top map's centre latitude, which changes the zoom it
+    // needs, so repeat a few times; this converges almost immediately.
+    for (let i = 0; i < 4; i++) {
+      const z = topZoomFor(bottom.getZoom(), bottom.getCenter().lat, top.getCenter().lat);
+      if (Math.abs(z - top.getZoom()) < 1e-6) return;
+      zoomMapAround(top, z, around || screenCenter());
+    }
+  }
+
+  function zoomTo(z, around) {
+    z = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, z));
+    if (Math.abs(z - bottom.getZoom()) < 1e-9) return;
+    zoomMapAround(bottom, z, around);
+    syncTopZoom(around);
+    changed();
+  }
+  function zoomBy(dz, around) { zoomTo(bottom.getZoom() + dz, around || screenCenter()); }
+
+  function panBoth(dx, dy) {
+    panMap(bottom, dx, dy);
+    panMap(top, dx, dy);
+    syncTopZoom();
+    changed();
+  }
+  function panTop(dx, dy) {
+    panMap(top, dx, dy);
+    syncTopZoom();
+    changed();
+  }
+
+  // ---------- Gesture handling ----------
+
+  const input = document.getElementById('input');
+  const lockTop = document.getElementById('lock-top');
+  const wheelMode = document.getElementById('wheel-mode');
+  const legendMode = document.getElementById('legend-mode');
+  let modifierHeld = false;
+
+  function topOnly(e) { return lockTop.checked || (e ? (e.shiftKey || e.altKey) : modifierHeld); }
+  function updateModeUI() {
+    const on = topOnly();
+    input.classList.toggle('top-mode', on);
+    legendMode.classList.toggle('on', on);
+  }
+
+  const pointers = new Map();
+  let pinch = null;
+
+  function pinchInfo() {
+    const [a, b] = [...pointers.values()];
+    return {
+      dist: Math.hypot(a.x - b.x, a.y - b.y) || 1,
+      mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
+    };
+  }
+
+  input.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 && e.pointerType === 'mouse') return;
+    input.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    input.classList.add('dragging');
+    if (pointers.size === 2) {
+      const p = pinchInfo();
+      pinch = { startDist: p.dist, startZoom: bottom.getZoom(), mid: p.mid };
+    }
+  });
+
+  input.addEventListener('pointermove', (e) => {
+    const p = pointers.get(e.pointerId);
+    if (!p) return;
+    const dx = e.clientX - p.x;
+    const dy = e.clientY - p.y;
+    p.x = e.clientX;
+    p.y = e.clientY;
+
+    if (pointers.size === 1) {
+      if (topOnly(e)) panTop(dx, dy); else panBoth(dx, dy);
+    } else if (pointers.size === 2 && pinch) {
+      const info = pinchInfo();
+      const mdx = info.mid.x - pinch.mid.x;
+      const mdy = info.mid.y - pinch.mid.y;
+      pinch.mid = info.mid;
+      if (mdx || mdy) panBoth(mdx, mdy);
+      zoomTo(pinch.startZoom + Math.log2(info.dist / pinch.startDist), info.mid);
+    }
+  });
+
+  function endPointer(e) {
+    pointers.delete(e.pointerId);
+    if (pointers.size < 2) pinch = null;
+    if (pointers.size === 0) input.classList.remove('dragging');
+  }
+  input.addEventListener('pointerup', endPointer);
+  input.addEventListener('pointercancel', endPointer);
+
+  // Safari reports trackpad pinches as gesture events instead of ctrl+wheel.
+  let gesture = null;
+  document.addEventListener('gesturestart', (e) => {
+    e.preventDefault();
+    gesture = { startZoom: bottom.getZoom() };
+  });
+  document.addEventListener('gesturechange', (e) => {
+    e.preventDefault();
+    if (!gesture) return;
+    const at = e.clientX != null ? { x: e.clientX, y: e.clientY } : screenCenter();
+    zoomTo(gesture.startZoom + Math.log2(e.scale), at);
+  });
+  document.addEventListener('gestureend', (e) => { e.preventDefault(); gesture = null; });
+
+  input.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    let dx = e.deltaX;
+    let dy = e.deltaY;
+    if (e.deltaMode === 1) { dx *= 16; dy *= 16; }
+    else if (e.deltaMode === 2) { dx *= window.innerWidth; dy *= window.innerHeight; }
+    const at = { x: e.clientX, y: e.clientY };
+
+    if (e.ctrlKey) {
+      // Chrome, Edge and Firefox deliver trackpad pinches as ctrl+wheel.
+      if (gesture) return;
+      const dz = Math.max(-1, Math.min(1, -dy / (100 * Math.LN2)));
+      zoomBy(dz, at);
+    } else if (topOnly(e)) {
+      panTop(-dx, -dy);
+    } else if (wheelMode.value === 'zoom') {
+      zoomBy(Math.max(-1, Math.min(1, -dy / 120)), at);
+    } else {
+      panBoth(-dx, -dy);
+    }
+  }, { passive: false });
+
+  input.addEventListener('dblclick', (e) => {
+    e.preventDefault();
+    zoomBy(e.shiftKey ? -1 : 1, { x: e.clientX, y: e.clientY });
+  });
+
+  // ---------- Keyboard ----------
+
+  const topEl = document.getElementById('top');
+  const panel = document.getElementById('panel');
+  const openPanelBtn = document.getElementById('open-panel');
+
+  function typingInField(e) {
+    const t = e.target;
+    return t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA');
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Shift' || e.key === 'Alt') { modifierHeld = true; updateModeUI(); }
+    if (e.key === 'Escape') {
+      if (typingInField(e)) { e.target.blur(); }
+      togglePanel();
+      return;
+    }
+    if (typingInField(e) || e.metaKey || e.ctrlKey) return;
+    const step = 80;
+    const pan = topOnly(e) ? panTop : panBoth;
+    switch (e.key) {
+      case 'ArrowLeft': pan(step, 0); break;
+      case 'ArrowRight': pan(-step, 0); break;
+      case 'ArrowUp': pan(0, step); break;
+      case 'ArrowDown': pan(0, -step); break;
+      case '+': case '=': zoomBy(0.5); break;
+      case '-': case '_': zoomBy(-0.5); break;
+      case ' ': topEl.classList.add('hidden'); break;
+      default: return;
+    }
+    e.preventDefault();
+  });
+  document.addEventListener('keyup', (e) => {
+    if (e.key === 'Shift' || e.key === 'Alt') { modifierHeld = e.shiftKey || e.altKey; updateModeUI(); }
+    if (e.key === ' ') topEl.classList.remove('hidden');
+  });
+  window.addEventListener('blur', () => {
+    modifierHeld = false;
+    updateModeUI();
+    topEl.classList.remove('hidden');
+  });
+  lockTop.addEventListener('change', updateModeUI);
+
+  // ---------- Panel ----------
+
+  function togglePanel(show) {
+    const visible = show != null ? show : panel.classList.contains('collapsed');
+    panel.classList.toggle('collapsed', !visible);
+    openPanelBtn.classList.toggle('shown', !visible);
+  }
+  document.getElementById('close-panel').addEventListener('click', () => togglePanel(false));
+  openPanelBtn.addEventListener('click', () => togglePanel(true));
+
+  const opacity = document.getElementById('opacity');
+  const opacityOut = document.getElementById('opacity-out');
+  function applyOpacity() {
+    topEl.style.opacity = opacity.value / 100;
+    opacityOut.textContent = opacity.value + '%';
+    changed();
+  }
+  opacity.addEventListener('input', applyOpacity);
+
+  const FILTERS = {
+    none: '',
+    tint: 'sepia(1) saturate(4) hue-rotate(-35deg)',
+    gray: 'grayscale(1) contrast(1.1)',
+    invert: 'invert(1) hue-rotate(180deg)',
+  };
+  const filterSel = document.getElementById('filter');
+  filterSel.addEventListener('change', () => { topEl.style.filter = FILTERS[filterSel.value] || ''; changed(); });
+
+  document.getElementById('recenter-top').addEventListener('click', () => {
+    top.jumpTo({ center: state.topAnchor });
+    syncTopZoom();
+    changed();
+  });
+
+  document.getElementById('swap').addEventListener('click', () => {
+    const b = bottom.getCenter();
+    const t = top.getCenter();
+    const bz = bottom.getZoom();
+    [state.bottomName, state.topName] = [state.topName, state.bottomName];
+    bottom.jumpTo({ center: t, zoom: topZoomFor(bz, b.lat, t.lat) });
+    top.jumpTo({ center: b, zoom: bz });
+    state.topAnchor = { lat: b.lat, lng: b.lng };
+    syncTopZoom();
+    changed();
+  });
+
+  // ---------- Search (Nominatim) ----------
+
+  async function geocode(q) {
+    const url = 'https://nominatim.openstreetmap.org/search?format=jsonv2&limit=6&q=' + encodeURIComponent(q);
+    const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+    if (!res.ok) throw new Error('Search failed (' + res.status + ')');
+    return res.json();
+  }
+
+  function placeBottom(r) {
+    const [s, n, w, e] = r.boundingbox.map(Number);
+    const cam = bottom.cameraForBounds([[w, s], [e, n]], { padding: PAD + 40, maxZoom: 15 });
+    if (cam) bottom.jumpTo(cam);
+    else bottom.jumpTo({ center: [Number(r.lon), Number(r.lat)] });
+    state.bottomName = r.display_name;
+    syncTopZoom();
+    changed();
+  }
+
+  function placeTop(r) {
+    const ll = { lat: Number(r.lat), lng: Number(r.lon) };
+    state.topAnchor = ll;
+    state.topName = r.display_name;
+    top.jumpTo({ center: ll, zoom: topZoomFor(bottom.getZoom(), bottom.getCenter().lat, ll.lat) });
+    changed();
+  }
+
+  document.querySelectorAll('form.search').forEach((form) => {
+    const target = form.dataset.target;
+    const field = form.querySelector('input');
+    const list = document.querySelector('ul.results[data-target="' + target + '"]');
+
+    function message(text) {
+      list.innerHTML = '';
+      const li = document.createElement('li');
+      li.className = 'msg';
+      li.textContent = text;
+      list.appendChild(li);
+    }
+
+    form.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const q = field.value.trim();
+      if (!q) return;
+      message('Searching…');
+      let results;
+      try { results = await geocode(q); }
+      catch (err) { message(err.message); return; }
+      if (!results.length) { message('No results'); return; }
+      list.innerHTML = '';
+      results.forEach((r) => {
+        const li = document.createElement('li');
+        li.tabIndex = 0;
+        li.textContent = r.display_name;
+        const choose = () => {
+          (target === 'bottom' ? placeBottom : placeTop)(r);
+          list.innerHTML = '';
+          field.value = '';
+          field.blur();
+        };
+        li.addEventListener('click', choose);
+        li.addEventListener('keydown', (e) => { if (e.key === 'Enter') choose(); });
+        list.appendChild(li);
+      });
+    });
+  });
+
+  // ---------- Legend, scale bar, URL state ----------
+
+  const legendBottom = document.getElementById('legend-bottom');
+  const legendTop = document.getElementById('legend-top');
+  const bottomName = document.getElementById('bottom-name');
+  const topName = document.getElementById('top-name');
+
+  function short(name) { return (name || '').split(',').slice(0, 2).join(','); }
+
+  function niceLength(maxMetres) {
+    const pow = Math.pow(10, Math.floor(Math.log10(maxMetres)));
+    const d = maxMetres / pow;
+    return (d >= 5 ? 5 : d >= 2 ? 2 : 1) * pow;
+  }
+
+  function updateScale() {
+    const mpp = metresPerPixel();
+    const maxPx = 120;
+
+    const m = niceLength(maxPx * mpp);
+    document.getElementById('scale-m').style.width = (m / mpp) + 'px';
+    document.getElementById('scale-m-txt').textContent = m >= 1000 ? (m / 1000) + ' km' : m + ' m';
+
+    const ft = maxPx * mpp * 3.28084;
+    let label, px;
+    if (ft > 5280) {
+      const mi = niceLength(ft / 5280);
+      px = mi * 1609.344 / mpp; label = mi + ' mi';
+    } else {
+      const f = niceLength(ft);
+      px = f / 3.28084 / mpp; label = f + ' ft';
+    }
+    document.getElementById('scale-i').style.width = px + 'px';
+    document.getElementById('scale-i-txt').textContent = label;
+  }
+
+  function updateLabels() {
+    legendBottom.textContent = short(state.bottomName);
+    legendTop.textContent = short(state.topName) + ' (' + opacity.value + '%)';
+    bottomName.textContent = state.bottomName;
+    bottomName.title = state.bottomName;
+    topName.textContent = state.topName;
+    topName.title = state.topName;
+  }
+
+  let saveTimer = null;
+  function saveHash() {
+    const b = bottom.getCenter();
+    const t = top.getCenter();
+    const a = state.topAnchor;
+    const params = new URLSearchParams({
+      b: [b.lat.toFixed(5), b.lng.toFixed(5), (bottom.getZoom() + OSM_ZOOM_OFFSET).toFixed(3)].join(','),
+      t: [t.lat.toFixed(5), t.lng.toFixed(5)].join(','),
+      a: [a.lat.toFixed(5), a.lng.toFixed(5)].join(','),
+      o: opacity.value,
+      bn: state.bottomName,
+      tn: state.topName,
+    });
+    if (filterSel.value !== 'none') params.set('f', filterSel.value);
+    history.replaceState(null, '', '#' + params.toString());
+  }
+
+  let frame = null;
+  function changed() {
+    if (frame == null) {
+      frame = requestAnimationFrame(() => {
+        frame = null;
+        updateScale();
+        updateLabels();
+      });
+    }
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(saveHash, 400);
+  }
+
+  function nums(s, n) {
+    if (!s) return null;
+    const v = s.split(',').map(Number);
+    return v.length >= n && v.slice(0, n).every(Number.isFinite) ? v : null;
+  }
+
+  function loadHash() {
+    const p = new URLSearchParams(location.hash.slice(1));
+    const b = nums(p.get('b'), 3) || [DEFAULTS.bottom.lat, DEFAULTS.bottom.lng, DEFAULTS.bottom.zoom];
+    const t = nums(p.get('t'), 2) || [DEFAULTS.top.lat, DEFAULTS.top.lng];
+    const a = nums(p.get('a'), 2) || t;
+    const o = Number(p.get('o'));
+    opacity.value = Number.isFinite(o) && p.has('o') ? Math.max(0, Math.min(100, o)) : DEFAULTS.opacity;
+    if (p.get('f') && FILTERS[p.get('f')] != null) filterSel.value = p.get('f');
+    state.bottomName = p.get('bn') || (p.has('b') ? '' : DEFAULTS.bottom.name);
+    state.topName = p.get('tn') || (p.has('t') ? '' : DEFAULTS.top.name);
+    state.topAnchor = { lat: a[0], lng: a[1] };
+
+    const bz = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, b[2] - OSM_ZOOM_OFFSET));
+    bottom.jumpTo({ center: [b[1], b[0]], zoom: bz });
+    top.jumpTo({ center: [t[1], t[0]], zoom: topZoomFor(bz, b[0], t[0]) });
+    topEl.style.filter = FILTERS[filterSel.value] || '';
+    topEl.style.opacity = opacity.value / 100;
+    opacityOut.textContent = opacity.value + '%';
+  }
+
+  window.addEventListener('resize', () => setTimeout(changed, 0));
+  bottom.on('error', (e) => console.warn('bottom map:', e.error && e.error.message));
+  top.on('error', (e) => console.warn('top map:', e.error && e.error.message));
+
+  loadHash();
+  updateModeUI();
+  changed();
+
+  // Expose for debugging in the console.
+  window.overlayMaps = { bottom, top, metresPerPixel };
+})();
+</script>
+</body>
+</html>
